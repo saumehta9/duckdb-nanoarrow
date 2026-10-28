@@ -80,11 +80,12 @@ nanoarrow::UniqueSchema CreateArrowIpcSchema(const vector<LogicalType>& types,
 
 ColumnDataCollectionSerializer::ColumnDataCollectionSerializer(
     ClientProperties options, Allocator& allocator,
-    ArrowIpcCompressionOptions compression, bool track_body_size)
+    ArrowIpcCompressionOptions compression, bool track_body_size, idx_t max_batch_bytes)
     : options(std::move(options)),
       allocator(allocator),
       compression(compression),
-      track_body_size(track_body_size) {}
+      track_body_size(track_body_size),
+      max_batch_bytes(max_batch_bytes) {}
 
 void ColumnDataCollectionSerializer::Init(const ArrowSchema* schema,
                                           const vector<LogicalType>& logical_types) {
@@ -164,41 +165,322 @@ static void DropUnusedValidity(ArrowArrayView& view) {
   }
 }
 
-idx_t ColumnDataCollectionSerializer::Serialize(ArrowAppender& appender) {
-  ArrowArray finalized = appender.Finalize();
-  nanoarrow::UniqueArray array(&finalized);
+static int64_t ValueOffset(const ArrowArrayView& view, int64_t i) {
+  const auto& offsets = view.buffer_views[1].data;
+  switch (view.storage_type) {
+    case NANOARROW_TYPE_LARGE_STRING:
+    case NANOARROW_TYPE_LARGE_BINARY:
+    case NANOARROW_TYPE_LARGE_LIST:
+      return offsets.as_int64[view.offset + i];
+    default:
+      return offsets.as_int32[view.offset + i];
+  }
+}
+
+namespace {
+constexpr int64_t kValidityWordBits = 64;
+
+int64_t CountValid(const uint8_t* bits, int64_t start, int64_t length) {
+  return length > 0 ? ArrowBitCountSet(bits, start, length) : 0;
+}
+
+//! Sizes the record batch bodies that rows of a batch take when appended on their own
+class BatchSizer {
+ public:
+  explicit BatchSizer(const ArrowArrayView& batch) : batch(batch) {
+    IndexValidity(batch);
+  }
+
+  // The padded body of rows [begin, end) of the batch
+  int64_t RowsSize(int64_t begin, int64_t end) const {
+    int64_t size = 0;
+    for (int64_t c = 0; c < batch.n_children; c++) {
+      size += SliceSize(*batch.children[c], begin, end);
+    }
+    return size;
+  }
+
+ private:
+  //! Valid elements before each 64-element word of a validity bitmap
+  struct ValidityIndex {
+    vector<int64_t> words;
+  };
+
+  void IndexValidity(const ArrowArrayView& view) {
+    for (int64_t c = 0; c < view.n_children; c++) {
+      const auto& child = *view.children[c];
+      // A bitmap DropUnusedValidity kept, so the array has nulls somewhere
+      if (child.layout.buffer_type[0] == NANOARROW_BUFFER_TYPE_VALIDITY &&
+          child.buffer_views[0].size_bytes > 0) {
+        const auto* bits = child.buffer_views[0].data.as_uint8;
+        const int64_t total = child.offset + child.length;
+        ValidityIndex index;
+        index.words.reserve(NumericCast<idx_t>(total / kValidityWordBits + 2));
+        int64_t valid = 0;
+        for (int64_t start = 0; start <= total; start += kValidityWordBits) {
+          index.words.push_back(valid);
+          valid += CountValid(bits, start,
+                              MinValue<int64_t>(kValidityWordBits, total - start));
+        }
+        validity[&child] = std::move(index);
+      }
+      IndexValidity(child);
+    }
+  }
+
+  // Whether elements [begin, end) of view hold a null, in constant time
+  bool HasNull(const ArrowArrayView& view, int64_t begin, int64_t end) const {
+    auto entry = validity.find(&view);
+    if (entry == validity.end() || begin == end) {
+      return false;
+    }
+    const auto* bits = view.buffer_views[0].data.as_uint8;
+    const auto& words = entry->second.words;
+    const int64_t first = view.offset + begin;
+    const int64_t last = view.offset + end;
+    const int64_t first_word = (first + kValidityWordBits - 1) / kValidityWordBits;
+    const int64_t last_word = last / kValidityWordBits;
+    int64_t valid;
+    if (first_word > last_word) {
+      valid = CountValid(bits, first, last - first);
+    } else {
+      valid = CountValid(bits, first, first_word * kValidityWordBits - first) +
+              words[NumericCast<idx_t>(last_word)] -
+              words[NumericCast<idx_t>(first_word)] +
+              CountValid(bits, last_word * kValidityWordBits,
+                         last - last_word * kValidityWordBits);
+    }
+    return valid < end - begin;
+  }
+
+  static int64_t ValueOffset(const ArrowArrayView& view, int64_t i) {
+    const auto& offsets = view.buffer_views[1].data;
+    switch (view.storage_type) {
+      case NANOARROW_TYPE_LARGE_STRING:
+      case NANOARROW_TYPE_LARGE_BINARY:
+      case NANOARROW_TYPE_LARGE_LIST:
+        return offsets.as_int64[view.offset + i];
+      default:
+        return offsets.as_int32[view.offset + i];
+    }
+  }
+
+  // The padded buffers of an array appended afresh from elements [begin, end) of view,
+  // children included, sized as ArrowArrayViewSetArray and DropUnusedValidity size them
+  int64_t SliceSize(const ArrowArrayView& view, int64_t begin, int64_t end) const;
+
+  const ArrowArrayView& batch;
+  unordered_map<const ArrowArrayView*, ValidityIndex> validity;
+};
+
+int64_t BatchSizer::SliceSize(const ArrowArrayView& view, int64_t begin,
+                              int64_t end) const {
+  const int64_t length = end - begin;
+  int64_t size = 0;
+  for (int64_t b = 0; b < view.array->n_buffers; b++) {
+    const auto bits = view.layout.element_size_bits[b];
+    switch (view.layout.buffer_type[b]) {
+      case NANOARROW_BUFFER_TYPE_NONE:
+        break;
+      case NANOARROW_BUFFER_TYPE_VALIDITY:
+        // A slice keeps the bitmap when it holds a null, or when the null count is
+        // unknown, which DropUnusedValidity does not drop
+        if (view.buffer_views[b].size_bytes > 0 && length > 0 &&
+            (view.null_count < 0 || HasNull(view, begin, end))) {
+          size += AlignValue<int64_t>(_ArrowBytesForBits(length));
+        }
+        break;
+      case NANOARROW_BUFFER_TYPE_TYPE_ID:
+      case NANOARROW_BUFFER_TYPE_UNION_OFFSET:
+        size += AlignValue<int64_t>(_ArrowBytesForBits(length * bits));
+        break;
+      case NANOARROW_BUFFER_TYPE_DATA_OFFSET:
+        // An empty array needs no offsets
+        if (length > 0) {
+          size += AlignValue<int64_t>(_ArrowBytesForBits((length + 1) * bits));
+        }
+        break;
+      case NANOARROW_BUFFER_TYPE_DATA:
+        switch (view.storage_type) {
+          case NANOARROW_TYPE_STRING:
+          case NANOARROW_TYPE_BINARY:
+          case NANOARROW_TYPE_LARGE_STRING:
+          case NANOARROW_TYPE_LARGE_BINARY:
+            if (length > 0) {
+              size +=
+                  AlignValue<int64_t>(ValueOffset(view, end) - ValueOffset(view, begin));
+            }
+            break;
+          default:
+            if (bits == 0) {
+              throw InternalException("Cannot size Arrow type %d for MAX_BATCH_BYTES",
+                                      static_cast<int>(view.storage_type));
+            }
+            size += AlignValue<int64_t>(_ArrowBytesForBits(length * bits));
+            break;
+        }
+        break;
+      default:
+        throw InternalException("Cannot size Arrow buffer type %d for MAX_BATCH_BYTES",
+                                static_cast<int>(view.layout.buffer_type[b]));
+    }
+  }
+  switch (view.storage_type) {
+    case NANOARROW_TYPE_LIST:
+    case NANOARROW_TYPE_LARGE_LIST:
+    case NANOARROW_TYPE_MAP:
+      if (length > 0) {
+        size += SliceSize(*view.children[0], ValueOffset(view, begin),
+                          ValueOffset(view, end));
+      } else {
+        size += SliceSize(*view.children[0], 0, 0);
+      }
+      break;
+    case NANOARROW_TYPE_FIXED_SIZE_LIST: {
+      const auto width = view.layout.child_size_elements;
+      size += SliceSize(*view.children[0], (view.offset + begin) * width,
+                        (view.offset + end) * width);
+      break;
+    }
+    case NANOARROW_TYPE_STRUCT:
+    case NANOARROW_TYPE_SPARSE_UNION:
+      for (int64_t c = 0; c < view.n_children; c++) {
+        size += SliceSize(*view.children[c], view.offset + begin, view.offset + end);
+      }
+      break;
+    default:
+      // DuckDB writes no other nested layout. Should one appear, all of its children
+      // bound what any slice can take.
+      for (int64_t c = 0; c < view.n_children; c++) {
+        size += SliceSize(*view.children[c], 0, view.children[c]->length);
+      }
+      break;
+  }
+  return size;
+}
+}  // namespace
+
+// Ends of the longest row ranges, in order, whose bodies fit max_bytes. A row that
+// does not fit on its own gets a range of its own.
+static vector<idx_t> SplitRows(const ArrowArrayView& view, int64_t max_bytes) {
+  const BatchSizer sizer(view);
+  vector<idx_t> ends;
+  const int64_t row_count = view.length;
+  int64_t begin = 0;
+  while (begin < row_count) {
+    // Rows up to fit are taken, rows up to beyond are too many. Sizes only grow with
+    // the end of the range, so a binary search finds the last end that fits.
+    int64_t fit = begin + 1;
+    int64_t beyond = row_count + 1;
+    if (sizer.RowsSize(begin, row_count) <= max_bytes) {
+      fit = row_count;
+    }
+    while (beyond - fit > 1) {
+      const auto mid = fit + (beyond - fit) / 2;
+      if (sizer.RowsSize(begin, mid) <= max_bytes) {
+        fit = mid;
+      } else {
+        beyond = mid;
+      }
+    }
+    ends.push_back(NumericCast<idx_t>(fit));
+    begin = fit;
+  }
+  return ends;
+}
+
+void ColumnDataCollectionSerializer::EncodeChunkView() {
   header->size_bytes = 0;
   body->size_bytes = 0;
-
-  THROW_NOT_OK(duckdb::InternalException, &error,
-               ArrowArrayViewSetArray(chunk_view.get(), array.get(), &error));
   DropUnusedValidity(*chunk_view.get());
   if (track_body_size) {
     // Measured as written: uncompressed buffer sizes, the dropped bitmaps at size 0
     ArrowBatchStatsMeasure(chunk_view.get(), &batch_measure);
   }
+  padded_body_size = PaddedBodySize(*chunk_view.get());
   if (compression.type == NANOARROW_IPC_COMPRESSION_TYPE_NONE) {
     // One exact allocation, where growing buffer by buffer doubles and keeps the peaks
-    NANOARROW_THROW_NOT_OK(
-        ArrowBufferReserve(body.get(), PaddedBodySize(*chunk_view.get())));
+    NANOARROW_THROW_NOT_OK(ArrowBufferReserve(body.get(), padded_body_size));
   }
   THROW_NOT_OK(InternalException, &error,
                ArrowIpcEncoderEncodeSimpleRecordBatch(encoder.get(), chunk_view.get(),
                                                       body.get(), &error));
   NANOARROW_THROW_NOT_OK(
       ArrowIpcEncoderFinalizeBuffer(encoder.get(), true, header.get()));
+}
 
+void ColumnDataCollectionSerializer::TakeBatch() {
+  ArrowEncodedBatch batch;
+  batch.header = GetHeader();
+  batch.body = GetBody();
+  batch.measure = batch_measure;
+  batches.push_back(std::move(batch));
+}
+
+idx_t ColumnDataCollectionSerializer::Serialize(ArrowAppender& appender) {
+  ArrowArray finalized = appender.Finalize();
+  nanoarrow::UniqueArray array(&finalized);
+  THROW_NOT_OK(duckdb::InternalException, &error,
+               ArrowArrayViewSetArray(chunk_view.get(), array.get(), &error));
+  EncodeChunkView();
   return 1;
 }
+
 idx_t ColumnDataCollectionSerializer::Serialize(const ColumnDataCollection& buffer) {
+  batches.clear();
   if (buffer.Count() == 0) {
     return 0;
   }
-  ArrowAppender appender(buffer.Types(), buffer.Count(), options, extension_types);
-  for (auto& chunk : buffer.Chunks()) {
-    appender.Append(chunk, 0, chunk.size(), chunk.size());
+  vector<idx_t> ends;
+  {
+    ArrowAppender appender(buffer.Types(), buffer.Count(), options, extension_types);
+    for (auto& chunk : buffer.Chunks()) {
+      appender.Append(chunk, 0, chunk.size(), chunk.size());
+    }
+    ArrowArray finalized = appender.Finalize();
+    nanoarrow::UniqueArray array(&finalized);
+    THROW_NOT_OK(duckdb::InternalException, &error,
+                 ArrowArrayViewSetArray(chunk_view.get(), array.get(), &error));
+    DropUnusedValidity(*chunk_view.get());
+    const auto max_bytes = NumericCast<int64_t>(max_batch_bytes);
+    if (max_batch_bytes == 0 || PaddedBodySize(*chunk_view.get()) <= max_bytes) {
+      EncodeChunkView();
+      TakeBatch();
+      return 1;
+    }
+    ends = SplitRows(*chunk_view.get(), max_bytes);
+    // The whole array is freed here, before the batches are appended again
   }
-  return Serialize(appender);
+  idx_t range = 0;
+  idx_t range_begin = 0;
+  auto appender =
+      make_uniq<ArrowAppender>(buffer.Types(), ends[0], options, extension_types);
+  idx_t chunk_begin = 0;
+  for (auto& chunk : buffer.Chunks()) {
+    idx_t from = 0;
+    while (from < chunk.size()) {
+      const auto to = MinValue<idx_t>(chunk.size(), ends[range] - chunk_begin);
+      appender->Append(chunk, from, to, chunk.size());
+      from = to;
+      if (chunk_begin + to < ends[range]) {
+        continue;
+      }
+      Serialize(*appender);
+      if (ends[range] - range_begin > 1 &&
+          padded_body_size > NumericCast<int64_t>(max_batch_bytes)) {
+        throw InternalException("Arrow record batch of %d bytes exceeds MAX_BATCH_BYTES",
+                                padded_body_size);
+      }
+      TakeBatch();
+      range_begin = ends[range];
+      if (++range < ends.size()) {
+        appender = make_uniq<ArrowAppender>(buffer.Types(), ends[range] - range_begin,
+                                            options, extension_types);
+      }
+    }
+    chunk_begin += chunk.size();
+  }
+  return batches.size();
 }
 
 namespace {
@@ -230,27 +512,43 @@ void WriteSlices(AsyncFileWriter& writer, nanoarrow::UniqueBuffer buffer) {
 }
 }  // namespace
 
-ArrowIpcFileBlock ColumnDataCollectionSerializer::Flush(AsyncFileWriter& writer) {
+ArrowIpcFileBlock ColumnDataCollectionSerializer::Flush(AsyncFileWriter& writer,
+                                                        ArrowEncodedBatch& message) {
   ArrowIpcFileBlock block{NumericCast<int64_t>(writer.GetTotalWritten()),
-                          NumericCast<int32_t>(header->size_bytes), body->size_bytes};
+                          NumericCast<int32_t>(message.header->size_bytes),
+                          message.body->size_bytes};
   // The message registers as one batch, so backpressure applies once, as parquet does
   auto batch = writer.StartBatch();
-  WriteSlices(writer, GetHeader());
-  if (body->size_bytes > 0) {
-    auto result_body = std::move(body);
-    InitArrowDuckBuffer(body.get(), allocator);
-    WriteSlices(writer, std::move(result_body));
+  WriteSlices(writer, std::move(message.header));
+  if (message.body->size_bytes > 0) {
+    WriteSlices(writer, std::move(message.body));
   }
   batch.Finish();
   return block;
 }
 
-ArrowIpcFileBlock ColumnDataCollectionSerializer::Flush(BufferedFileWriter& writer) {
+ArrowIpcFileBlock ColumnDataCollectionSerializer::Flush(BufferedFileWriter& writer,
+                                                        ArrowEncodedBatch& message) {
   ArrowIpcFileBlock block{NumericCast<int64_t>(writer.GetTotalWritten()),
-                          NumericCast<int32_t>(header->size_bytes), body->size_bytes};
-  writer.WriteData(header->data, header->size_bytes);
-  writer.WriteData(body->data, body->size_bytes);
+                          NumericCast<int32_t>(message.header->size_bytes),
+                          message.body->size_bytes};
+  writer.WriteData(message.header->data, message.header->size_bytes);
+  writer.WriteData(message.body->data, message.body->size_bytes);
   return block;
+}
+
+ArrowIpcFileBlock ColumnDataCollectionSerializer::Flush(AsyncFileWriter& writer) {
+  ArrowEncodedBatch message;
+  message.header = GetHeader();
+  message.body = GetBody();
+  return Flush(writer, message);
+}
+
+ArrowIpcFileBlock ColumnDataCollectionSerializer::Flush(BufferedFileWriter& writer) {
+  ArrowEncodedBatch message;
+  message.header = GetHeader();
+  message.body = GetBody();
+  return Flush(writer, message);
 }
 nanoarrow::UniqueBuffer ColumnDataCollectionSerializer::GetHeader() {
   auto result_header = std::move(header);

@@ -1,0 +1,98 @@
+# name: test/sql/max_batch_bytes.test
+# description: COPY TO Arrow IPC limits the uncompressed size of record batch bodies with MAX_BATCH_BYTES
+# group: [sql]
+
+require nanoarrow
+
+test-env DATA_PATH {TEST_DIR}
+
+# A BIGINT column without NULLs takes 8 bytes a row, so 1024 rows fill 8192 bytes
+query II
+WITH s AS (COPY (SELECT i AS id FROM range(5000) t(i)) TO '{DATA_PATH}/bigint.arrow' (FORMAT ARROW, MAX_BATCH_BYTES 8192, RETURN_STATS)) SELECT count, extra_info['record_batch_count']::UBIGINT FROM s
+----
+5000	5
+
+# The rows read back in order
+query IIII
+SELECT count(*), sum(id), min(id), max(id) FROM read_arrow('{DATA_PATH}/bigint.arrow')
+----
+5000	12497500	0	4999
+
+query I
+SELECT count(*) FROM (SELECT id, row_number() OVER () - 1 AS expected FROM read_arrow('{DATA_PATH}/bigint.arrow')) WHERE id <> expected
+----
+0
+
+# Without the option the same rows fit one record batch
+query I
+WITH s AS (COPY (SELECT i AS id FROM range(5000) t(i)) TO '{DATA_PATH}/bigint_default.arrow' (FORMAT ARROW, RETURN_STATS)) SELECT extra_info['record_batch_count']::UBIGINT FROM s
+----
+1
+
+# Sizes are parsed like ROW_GROUP_SIZE_BYTES: 8KiB is 8192 bytes and 8KB is 8000
+query I
+WITH s AS (COPY (SELECT i AS id FROM range(2048) t(i)) TO '{DATA_PATH}/kib.arrow' (FORMAT ARROW, MAX_BATCH_BYTES '8KiB', RETURN_STATS)) SELECT extra_info['record_batch_count']::UBIGINT FROM s
+----
+2
+
+query I
+WITH s AS (COPY (SELECT i AS id FROM range(2048) t(i)) TO '{DATA_PATH}/kb.arrow' (FORMAT ARROW, MAX_BATCH_BYTES '8KB', RETURN_STATS)) SELECT extra_info['record_batch_count']::UBIGINT FROM s
+----
+3
+
+# The uncompressed bodies add up to the same total either way
+query I
+WITH s AS (COPY (SELECT i AS id FROM range(5000) t(i)) TO '{DATA_PATH}/bigint_zstd.arrow' (FORMAT ARROW, MAX_BATCH_BYTES 8192, COMPRESSION 'zstd', RETURN_STATS)) SELECT extra_info['record_batch_count']::UBIGINT || ' ' || extra_info['total_uncompressed_size'] FROM s
+----
+5 40000
+
+# A row larger than the limit is written in a record batch of its own
+query II
+WITH s AS (COPY (SELECT repeat('x', 10000) AS s FROM range(3)) TO '{DATA_PATH}/large_rows.arrows' (FORMAT ARROWS, MAX_BATCH_BYTES 1000, RETURN_STATS)) SELECT count, extra_info['record_batch_count']::UBIGINT FROM s
+----
+3	3
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/large_rows.arrows') WHERE s = repeat('x', 10000)
+----
+3
+
+# Strings, NULLs and nested values split at row boundaries and read back unchanged
+statement ok
+CREATE TABLE nested AS SELECT i AS id, CASE WHEN i % 3 = 0 THEN NULL ELSE repeat('y', i % 300) END AS s, CASE WHEN i % 7 = 0 THEN NULL ELSE {'a': i, 'b': [repeat('q', i % 40), NULL]} END AS st, [i, i + 1]::BIGINT[2] AS arr, map([i::VARCHAR], [i % 5]) AS m FROM range(20000) t(i)
+
+query I
+WITH s AS (COPY nested TO '{DATA_PATH}/nested.arrow' (FORMAT ARROW, MAX_BATCH_BYTES 65536, RETURN_STATS)) SELECT extra_info['record_batch_count']::UBIGINT > 20 FROM s
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM nested EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/nested.arrow'))
+----
+0
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/nested.arrow')
+----
+20000
+
+# ROW_GROUPS_PER_FILE counts the batches DuckDB hands over, before they are split
+query III
+WITH s AS (COPY (SELECT i AS id FROM range(10000) t(i)) TO '{DATA_PATH}/parts' (FORMAT ARROW, CHUNK_SIZE 2048, ROW_GROUPS_PER_FILE 2, MAX_BATCH_BYTES 8192, RETURN_STATS)) SELECT count(*), sum(count), sum(extra_info['record_batch_count']::UBIGINT) FROM s
+----
+3	10000	10
+
+statement error
+COPY (SELECT 1 AS i) TO '{DATA_PATH}/zero.arrow' (MAX_BATCH_BYTES 0)
+----
+MAX_BATCH_BYTES must be between 1 and
+
+statement error
+COPY (SELECT 1 AS i) TO '{DATA_PATH}/null.arrow' (MAX_BATCH_BYTES NULL)
+----
+MAX_BATCH_BYTES must not be NULL
+
+statement error
+COPY (SELECT 1 AS i) TO '{DATA_PATH}/negative.arrow' (MAX_BATCH_BYTES -5)
+----
+Unable to parse MAX_BATCH_BYTES

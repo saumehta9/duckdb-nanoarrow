@@ -28,7 +28,7 @@ struct ArrowStreamWriter {
                     const vector<pair<string, string>>& metadata,
                     const vector<ArrowFieldMetadata>& field_metadata,
                     const ArrowIpcCompressionOptions& compression, bool file_format,
-                    bool size_metadata);
+                    bool size_metadata, idx_t max_batch_bytes = 0);
 
   //! Removes the output when Finalize did not run, as parquet and csv writers do
   ~ArrowStreamWriter();
@@ -73,6 +73,8 @@ struct ArrowStreamWriter {
   vector<LogicalType> logical_types;
   bool file_format;
   bool size_metadata;
+  //! The largest uncompressed record batch body, zero for no limit
+  idx_t max_batch_bytes;
   mutex lock;
   //! Writes on the async pool, so a remote output uploads several parts at once
   unique_ptr<AsyncFileWriter> async_writer;

@@ -112,13 +112,15 @@ ArrowStreamWriter::ArrowStreamWriter(const ClientProperties& options_p, FileSyst
                                      const vector<pair<string, string>>& metadata,
                                      const vector<ArrowFieldMetadata>& field_metadata,
                                      const ArrowIpcCompressionOptions& compression,
-                                     bool file_format, bool size_metadata)
+                                     bool file_format, bool size_metadata,
+                                     idx_t max_batch_bytes)
     : options(options_p),
       allocator(BufferAllocator::Get(*options.client_context)),
       compression(compression),
       logical_types(logical_types),
       file_format(file_format),
-      size_metadata(size_metadata) {
+      size_metadata(size_metadata),
+      max_batch_bytes(max_batch_bytes) {
   InitSchema(schema_p, metadata, field_metadata);
   InitOutputFile(fs, file_path);
 }
@@ -191,23 +193,28 @@ void ArrowStreamWriter::WriteSchema() {
 
 unique_ptr<ColumnDataCollectionSerializer> ArrowStreamWriter::NewSerializer() const {
   auto serializer = make_uniq<ColumnDataCollectionSerializer>(
-      options, allocator, compression, size_metadata || written_stats);
+      options, allocator, compression, size_metadata || written_stats, max_batch_bytes);
   serializer->Init(schema.get(), logical_types);
   return serializer;
 }
 
 void ArrowStreamWriter::Flush(ColumnDataCollectionSerializer& serializer) {
   lock_guard<mutex> guard(lock);
-  auto block = WriteMessage(serializer);
-  if (file_format) {
-    blocks.push_back(block);
+  for (auto& batch : serializer.Batches()) {
+    auto block = async_writer
+                     ? ColumnDataCollectionSerializer::Flush(*async_writer, batch)
+                     : ColumnDataCollectionSerializer::Flush(*writer, batch);
+    if (file_format) {
+      blocks.push_back(block);
+    }
+    if (size_metadata || written_stats) {
+      ArrowBatchStatsAdd(&batch_stats, &batch.measure, block.metadata_length,
+                         block.body_length,
+                         compression.type != NANOARROW_IPC_COMPRESSION_TYPE_NONE);
+    }
+    ++row_group_count;
   }
-  if (size_metadata || written_stats) {
-    ArrowBatchStatsAdd(&batch_stats, &serializer.BatchMeasure(), block.metadata_length,
-                       block.body_length,
-                       compression.type != NANOARROW_IPC_COMPRESSION_TYPE_NONE);
-  }
-  ++row_group_count;
+  serializer.Batches().clear();
   file_size = TotalWritten();
 }
 

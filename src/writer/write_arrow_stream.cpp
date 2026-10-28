@@ -4,8 +4,10 @@
 #include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "file_scanner/arrow_multi_file_info.hpp"
 
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/serializer/buffered_file_writer.hpp"
 #include "duckdb/function/copy_function.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "nanoarrow/nanoarrow_ipc.hpp"
@@ -31,12 +33,37 @@ struct ArrowWriteBindData : public TableFunctionData {
   bool file_format = true;
   bool size_metadata = false;
   idx_t row_group_size = 122880;
+  //! Zero leaves record batches as large as row_group_size makes them
+  idx_t max_batch_bytes = 0;
   string type_metadata_namespace;
 };
 
 struct ArrowWriteGlobalState : public GlobalFunctionData {
   unique_ptr<ArrowStreamWriter> writer;
 };
+
+// A byte count, or a size such as '16MB' or '16MiB' as ROW_GROUP_SIZE_BYTES takes it
+idx_t ParseMaxBatchBytes(const Value& value) {
+  if (value.IsNull()) {
+    throw BinderException("MAX_BATCH_BYTES must not be NULL");
+  }
+  idx_t bytes;
+  if (value.type().id() == LogicalTypeId::VARCHAR) {
+    bytes = DBConfig::ParseMemoryLimit(value.ToString());
+  } else {
+    auto cast_value = value.DefaultTryCastAs(LogicalType::UBIGINT);
+    if (!cast_value) {
+      throw BinderException("Unable to parse MAX_BATCH_BYTES from \"%s\"",
+                            value.ToString());
+    }
+    bytes = cast_value->GetValue<uint64_t>();
+  }
+  if (bytes == 0 || bytes > static_cast<idx_t>(NumericLimits<int64_t>::Maximum())) {
+    throw BinderException("MAX_BATCH_BYTES must be between 1 and %d bytes",
+                          NumericLimits<int64_t>::Maximum());
+  }
+  return bytes;
+}
 
 // Reads the entries of a STRUCT option value as key/value pairs, blobs as raw bytes
 vector<pair<string, string>> ReadMetadataPairs(const Value& kv_struct,
@@ -123,6 +150,8 @@ unique_ptr<FunctionData> ArrowWriteBind(ClientContext& context,
     }
     if (loption == "chunk_size") {
       bind_data->row_group_size = option.second[0].GetValue<uint64_t>();
+    } else if (loption == "max_batch_bytes") {
+      bind_data->max_batch_bytes = ParseMaxBatchBytes(option.second[0]);
     } else if (loption == "kv_metadata") {
       bind_data->kv_metadata =
           ReadMetadataPairs(option.second[0], "kv_metadata argument");
@@ -200,7 +229,7 @@ unique_ptr<GlobalFunctionData> ArrowWriteInitializeGlobal(ClientContext& context
   global_state->writer = make_uniq<ArrowStreamWriter>(
       arrow_bind.options, fs, file_path, arrow_bind.sql_types, *arrow_bind.schema.get(),
       arrow_bind.kv_metadata, arrow_bind.field_metadata, arrow_bind.compression,
-      arrow_bind.file_format, arrow_bind.size_metadata);
+      arrow_bind.file_format, arrow_bind.size_metadata, arrow_bind.max_batch_bytes);
   global_state->writer->WriteSchema();
   return std::move(global_state);
 }
